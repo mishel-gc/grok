@@ -2,9 +2,12 @@ package grok
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/spf13/cast"
 )
 
 const (
@@ -19,6 +22,11 @@ var (
 	validPattern    = regexp.MustCompile(`^\w+([-.]\w+)*(:([-.\w]+)(:(string|str|float|int|bool))?)?$`)
 	normalPattern   = regexp.MustCompile(`%{([\w-.]+(?::[\w-.]+(?::[\w-.]+)?)?)}`)
 	symbolicPattern = regexp.MustCompile(`\W`)
+)
+
+var (
+	ErrNotCompiled = errors.New("not compiled")
+	ErrMismatch    = errors.New("mismatch")
 )
 
 // GrokPattern represents a grok pattern with its denormalized regular expression
@@ -199,4 +207,208 @@ func CopyDefalutPatterns() map[string]string {
 		ret[k] = v
 	}
 	return ret
+}
+
+// SubMatchName holds information about named submatches in a regex
+type SubMatchName struct {
+	name         []string
+	subexpIndex  []int
+	subexpCount  int
+}
+
+// GrokRegexp represents a compiled grok pattern as a regular expression
+type GrokRegexp struct {
+	grokPattern   *GrokPattern
+	re            *regexp.Regexp
+	subMatchNames SubMatchName
+}
+
+// MatchNames returns the list of named capture group names
+func (g *GrokRegexp) MatchNames() []string {
+	return g.subMatchNames.name
+}
+
+// Run executes the compiled pattern against the content string
+// Returns a slice of matched values corresponding to the named groups
+func (g *GrokRegexp) Run(content string, trimSpace bool) ([]string, error) {
+	if g.re == nil {
+		return nil, ErrNotCompiled
+	}
+
+	match := g.re.FindStringSubmatchIndex(content)
+	if len(match) == 0 {
+		return nil, ErrMismatch
+	}
+	if g.subMatchNames.subexpCount*2 != len(match) {
+		return nil, ErrMismatch
+	}
+
+	result := make([]string, len(g.subMatchNames.name))
+
+	for i := range g.subMatchNames.name {
+		idx := g.subMatchNames.subexpIndex[i]
+
+		left := match[2*idx]
+		right := match[2*idx+1]
+		if left == -1 || right == -1 {
+			continue
+		}
+
+		if trimSpace {
+			result[i] = strings.TrimSpace(content[left:right])
+		} else {
+			result[i] = content[left:right]
+		}
+	}
+
+	return result, nil
+}
+
+// GetValByName retrieves a matched value by its capture group name
+func (g *GrokRegexp) GetValByName(k string, val []string) (string, bool) {
+	if len(val) != len(g.subMatchNames.name) {
+		return "", false
+	}
+	for i, name := range g.subMatchNames.name {
+		if name == k {
+			return val[i], true
+		}
+	}
+	return "", false
+}
+
+// WithTypeInfo returns true if the pattern has type information
+func (g *GrokRegexp) WithTypeInfo() bool {
+	return len(g.grokPattern.varbType) > 0
+}
+
+// RunWithTypeInfo executes the pattern and converts matched values to their typed equivalents
+func (g *GrokRegexp) RunWithTypeInfo(content string, trimSpace bool) ([]interface{}, error) {
+	ret, err := g.Run(content, trimSpace)
+	if err != nil {
+		return nil, err
+	}
+
+	castDst := make([]interface{}, len(g.subMatchNames.name))
+
+	for i, name := range g.subMatchNames.name {
+		castDst[i], _ = g.GetValCastByName(name, ret)
+	}
+
+	return castDst, nil
+}
+
+// GetValCastByName retrieves a matched value by name and converts it to its typed value
+func (g *GrokRegexp) GetValCastByName(k string, val []string) (interface{}, bool) {
+	if len(val) != len(g.subMatchNames.name) {
+		return nil, false
+	}
+
+	for i, name := range g.subMatchNames.name {
+		if name == k {
+			if varType, ok := g.grokPattern.varbType[name]; ok {
+				var dstV interface{}
+				switch varType {
+				case GTypeInt:
+					dstV, _ = cast.ToInt64E(val[i])
+				case GTypeFloat:
+					dstV, _ = cast.ToFloat64E(val[i])
+				case GTypeBool:
+					dstV, _ = cast.ToBoolE(val[i])
+				case GTypeStr:
+					dstV = val[i]
+				default:
+					return nil, false
+				}
+				return dstV, true
+			} else {
+				return val[i], true
+			}
+		}
+	}
+	return nil, false
+}
+
+// GetValAnyByName retrieves a matched value by name from a slice of any type
+func (g *GrokRegexp) GetValAnyByName(k string, val []interface{}) (interface{}, bool) {
+	if len(val) != len(g.subMatchNames.name) {
+		return "", false
+	}
+	for i, name := range g.subMatchNames.name {
+		if name == k {
+			return val[i], true
+		}
+	}
+	return "", false
+}
+
+// CompilePattern compiles a grok pattern into a GrokRegexp
+func CompilePattern(input string, denormalized PatternStorageIface) (*GrokRegexp, error) {
+	gP, err := DenormalizePattern(input, denormalized)
+	if err != nil {
+		return nil, err
+	}
+	
+	re, err := regexp.Compile(gP.denormalized)
+	if err != nil {
+		return nil, err
+	}
+
+	var subMatchNames SubMatchName
+	for i, name := range re.SubexpNames() {
+		if name != "" {
+			// Update index for duplicate names
+			for j := range subMatchNames.name {
+				if subMatchNames.name[j] == name {
+					subMatchNames.subexpIndex[j] = i
+					break
+				}
+			}
+
+			// Insert name and index
+			subMatchNames.name = append(subMatchNames.name, name)
+			subMatchNames.subexpIndex = append(subMatchNames.subexpIndex, i)
+		}
+	}
+
+	subMatchNames.subexpCount = len(re.SubexpNames())
+
+	return &GrokRegexp{
+		grokPattern:   gP,
+		re:            re,
+		subMatchNames: subMatchNames,
+	}, nil
+}
+
+// CompilePattern2 compiles a pre-denormalized GrokPattern into a GrokRegexp
+func CompilePattern2(gP *GrokPattern, denormalized PatternStorageIface) (*GrokRegexp, error) {
+	re, err := regexp.Compile(gP.denormalized)
+	if err != nil {
+		return nil, err
+	}
+
+	var subMatchNames SubMatchName
+	for i, name := range re.SubexpNames() {
+		if name != "" {
+			// Update index for duplicate names
+			for j := range subMatchNames.name {
+				if subMatchNames.name[j] == name {
+					subMatchNames.subexpIndex[j] = i
+					break
+				}
+			}
+
+			// Insert name and index
+			subMatchNames.name = append(subMatchNames.name, name)
+			subMatchNames.subexpIndex = append(subMatchNames.subexpIndex, i)
+		}
+	}
+
+	subMatchNames.subexpCount = len(re.SubexpNames())
+
+	return &GrokRegexp{
+		grokPattern:   gP,
+		re:            re,
+		subMatchNames: subMatchNames,
+	}, nil
 }

@@ -417,3 +417,267 @@ func TestTypeAnnotations(t *testing.T) {
 		})
 	}
 }
+
+func TestCompilePattern(t *testing.T) {
+	defaultPatterns := CopyDefalutPatterns()
+	denormalized, errs := DenormalizePatternsFromMap(defaultPatterns)
+	
+	if len(errs) != 0 {
+		t.Fatalf("Failed to denormalize default patterns: %v", errs)
+	}
+	
+	storage := PatternStorage{denormalized}
+	
+	tests := []struct {
+		name        string
+		pattern     string
+		testText    string
+		wantMatch   bool
+		wantError   bool
+		checkFields []string
+	}{
+		{
+			name:      "simple IP pattern",
+			pattern:   "%{IP:ip}",
+			testText:  "192.168.1.1",
+			wantMatch: true,
+			checkFields: []string{"ip"},
+		},
+		{
+			name:      "apache log",
+			pattern:   "%{COMMONAPACHELOG}",
+			testText:  `127.0.0.1 - - [23/Apr/2014:22:58:32 +0200] "GET /index.php HTTP/1.1" 404 207`,
+			wantMatch: true,
+			checkFields: []string{"clientip", "response", "bytes"},
+		},
+		{
+			name:      "pattern with type",
+			pattern:   "%{NUMBER:port:int}",
+			testText:  "8080",
+			wantMatch: true,
+			checkFields: []string{"port"},
+		},
+		{
+			name:      "invalid pattern",
+			pattern:   "%{NONEXISTENT}",
+			wantError: true,
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gr, err := CompilePattern(tt.pattern, storage)
+			
+			if tt.wantError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+				return
+			}
+			
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			
+			if tt.testText != "" {
+				result, err := gr.Run(tt.testText, false)
+				
+				if tt.wantMatch {
+					if err != nil {
+						t.Fatalf("Expected match but got error: %v", err)
+					}
+					
+					// Check that expected fields exist
+					matchNames := gr.MatchNames()
+					for _, expectedField := range tt.checkFields {
+						found := false
+						for _, name := range matchNames {
+							if name == expectedField {
+								found = true
+								break
+							}
+						}
+						if !found {
+							t.Errorf("Expected field %q not found in match names: %v", expectedField, matchNames)
+						}
+					}
+					
+					// Verify we got results
+					if len(result) == 0 {
+						t.Error("Expected non-empty result")
+					}
+				} else {
+					if err == nil {
+						t.Error("Expected no match but got one")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGrokRegexpRun(t *testing.T) {
+	defaultPatterns := CopyDefalutPatterns()
+	denormalized, _ := DenormalizePatternsFromMap(defaultPatterns)
+	storage := PatternStorage{denormalized}
+	
+	gr, err := CompilePattern("%{IP:server} %{NUMBER:port:int} %{WORD:status}", storage)
+	if err != nil {
+		t.Fatalf("Failed to compile pattern: %v", err)
+	}
+	
+	testLine := "192.168.1.1 8080 active"
+	
+	// Test Run
+	result, err := gr.Run(testLine, false)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	
+	if len(result) != len(gr.MatchNames()) {
+		t.Errorf("Result length %d doesn't match names length %d", len(result), len(gr.MatchNames()))
+	}
+	
+	// Test GetValByName
+	serverIP, ok := gr.GetValByName("server", result)
+	if !ok {
+		t.Error("Expected to find 'server' field")
+	}
+	if serverIP != "192.168.1.1" {
+		t.Errorf("server = %q, want %q", serverIP, "192.168.1.1")
+	}
+	
+	port, ok := gr.GetValByName("port", result)
+	if !ok {
+		t.Error("Expected to find 'port' field")
+	}
+	if port != "8080" {
+		t.Errorf("port = %q, want %q", port, "8080")
+	}
+	
+	status, ok := gr.GetValByName("status", result)
+	if !ok {
+		t.Error("Expected to find 'status' field")
+	}
+	if status != "active" {
+		t.Errorf("status = %q, want %q", status, "active")
+	}
+}
+
+func TestGrokRegexpWithTypeInfo(t *testing.T) {
+	defaultPatterns := CopyDefalutPatterns()
+	denormalized, _ := DenormalizePatternsFromMap(defaultPatterns)
+	storage := PatternStorage{denormalized}
+	
+	gr, err := CompilePattern("%{IP:server} %{NUMBER:port:int} %{NUMBER:ratio:float}", storage)
+	if err != nil {
+		t.Fatalf("Failed to compile pattern: %v", err)
+	}
+	
+	if !gr.WithTypeInfo() {
+		t.Error("Expected pattern to have type info")
+	}
+	
+	testLine := "192.168.1.1 8080 3.14"
+	
+	// Test RunWithTypeInfo
+	result, err := gr.RunWithTypeInfo(testLine, false)
+	if err != nil {
+		t.Fatalf("RunWithTypeInfo failed: %v", err)
+	}
+	
+	// Check types
+	portVal, ok := gr.GetValAnyByName("port", result)
+	if !ok {
+		t.Error("Expected to find 'port' field")
+	}
+	if portInt, ok := portVal.(int64); !ok {
+		t.Errorf("port should be int64, got %T", portVal)
+	} else if portInt != 8080 {
+		t.Errorf("port = %d, want 8080", portInt)
+	}
+	
+	ratioVal, ok := gr.GetValAnyByName("ratio", result)
+	if !ok {
+		t.Error("Expected to find 'ratio' field")
+	}
+	if ratioFloat, ok := ratioVal.(float64); !ok {
+		t.Errorf("ratio should be float64, got %T", ratioVal)
+	} else if ratioFloat != 3.14 {
+		t.Errorf("ratio = %f, want 3.14", ratioFloat)
+	}
+}
+
+func TestGrokRegexpTrimSpace(t *testing.T) {
+	defaultPatterns := CopyDefalutPatterns()
+	denormalized, _ := DenormalizePatternsFromMap(defaultPatterns)
+	storage := PatternStorage{denormalized}
+	
+	gr, err := CompilePattern("%{WORD:field}", storage)
+	if err != nil {
+		t.Fatalf("Failed to compile pattern: %v", err)
+	}
+	
+	testLine := "  test  "
+	
+	// Without trim
+	result, err := gr.Run(testLine, false)
+	if err == nil {
+		t.Error("Expected mismatch for text with leading spaces")
+	}
+	
+	// Test with actual match
+	testLine2 := "test  "
+	result, err = gr.Run(testLine2, false)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	
+	field, _ := gr.GetValByName("field", result)
+	if field != "test" {
+		t.Errorf("Without trim: field = %q, want %q", field, "test")
+	}
+	
+	// With trim
+	result, err = gr.Run(testLine2, true)
+	if err != nil {
+		t.Fatalf("Run with trim failed: %v", err)
+	}
+	
+	field, _ = gr.GetValByName("field", result)
+	if field != "test" {
+		t.Errorf("With trim: field = %q, want %q", field, "test")
+	}
+}
+
+func TestCompilePattern2(t *testing.T) {
+	defaultPatterns := CopyDefalutPatterns()
+	denormalized, _ := DenormalizePatternsFromMap(defaultPatterns)
+	storage := PatternStorage{denormalized}
+	
+	// First denormalize a pattern
+	gp, err := DenormalizePattern("%{IP:address}", storage)
+	if err != nil {
+		t.Fatalf("Failed to denormalize pattern: %v", err)
+	}
+	
+	// Then compile it using CompilePattern2
+	gr, err := CompilePattern2(gp, storage)
+	if err != nil {
+		t.Fatalf("Failed to compile with CompilePattern2: %v", err)
+	}
+	
+	testLine := "192.168.1.1"
+	result, err := gr.Run(testLine, false)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	
+	address, ok := gr.GetValByName("address", result)
+	if !ok {
+		t.Error("Expected to find 'address' field")
+	}
+	if address != "192.168.1.1" {
+		t.Errorf("address = %q, want %q", address, "192.168.1.1")
+	}
+}
